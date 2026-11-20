@@ -28,6 +28,35 @@
     ]);
     return { weights, meals, workouts, machines, foods, profile };
   };
+  /* ネイティブ連携ブリッジ。Health Connect / HealthKit を読むのは端末内の
+   * companion アプリだけで、このPWAは正規化済みデータをIndexedDBへ保存する。
+   * 公開Webや外部サービスへ健康データを送る処理は一切行わない。 */
+  async function receiveHealthSnapshot(payload) {
+    const status = { lastAttempt: new Date().toISOString(), source: payload && payload.source };
+    try {
+      if (!payload || !['health-connect', 'healthkit'].includes(payload.source) || !payload.records) throw new Error('連携データの形式が正しくありません');
+      const [oldWeights, oldMeals] = await Promise.all([DB.all('weights'), DB.all('meals')]);
+      let weights = 0, meals = 0, skipped = 0;
+      for (const x of payload.records.weights || []) {
+        const date = String(x.date || x.time || '').slice(0, 10), kg = num(x.kg);
+        if (!/^\d{4}-\d\d-\d\d$/.test(date) || !kg) { skipped++; continue; }
+        const externalId = String(x.id || `${date}|${kg}|${x.bodyFatPct || ''}`);
+        if (oldWeights.some((r) => r.healthSource === payload.source && r.healthId === externalId)) { skipped++; continue; }
+        await DB.put('weights', { date, kg, bodyFatPct: num(x.bodyFatPct), skeletalMuscleKg: num(x.skeletalMuscleKg), fatKg: num(x.fatKg), bmr: num(x.bmr), healthSource: payload.source, healthId: externalId, source: 'health-sync', note: 'ヘルス連携' }); weights++;
+      }
+      for (const x of payload.records.meals || []) {
+        const date = String(x.date || x.startTime || '').slice(0, 10), kcal = num(x.kcal), name = String(x.name || 'ヘルス連携の食事');
+        if (!/^\d{4}-\d\d-\d\d$/.test(date) || kcal == null) { skipped++; continue; }
+        const externalId = String(x.id || `${date}|${x.startTime || ''}|${kcal}|${x.protein || ''}`);
+        if (oldMeals.some((r) => r.healthSource === payload.source && r.healthId === externalId)) { skipped++; continue; }
+        await DB.put('meals', { date, name, kcal, protein: num(x.protein), fat: num(x.fat), carbs: num(x.carbs), salt: num(x.salt), qty: 1, mealType: x.mealType || '食事', valueType: 'external', source: 'ヘルス連携', healthSource: payload.source, healthId: externalId }); meals++;
+      }
+      await DB.kvSet('healthSyncStatus', Object.assign(status, { lastSuccess: new Date().toISOString(), weights, meals, skipped, error: null }));
+      window.dispatchEvent(new CustomEvent('mfa-health-synced')); return { weights, meals, skipped };
+    } catch (e) { await DB.kvSet('healthSyncStatus', Object.assign(status, { error: e.message })); throw e; }
+  }
+  // companion 側は window.MyFitnessAIHealth.receive(snapshot) を直接呼び出す。
+  window.MyFitnessAIHealth = { receive: receiveHealthSnapshot, version: 1 };
   const byNewest = (a, b) => (b.date + b.createdAt).localeCompare(a.date + a.createdAt);
   const machineName = (machines, id) => { const m = machines.find((x) => x.id === id); return m ? m.name : '（不明なマシン）'; };
   const latestWeight = (weights) => COACH.dailyWeights(weights).slice(-1)[0];
@@ -492,8 +521,8 @@
         <div class="card hero"><h2>今日・今週の成果</h2><div class="stats"><div class="stat"><b>${energyText(weekAct.energy)}</b><span>今週の運動消費</span></div><div class="stat"><b>${fmt(weekAct.volumeKg)}</b><span>総挙上kg</span></div><div class="stat"><b>${weekAct.cardioMin}</b><span>有酸素 分</span></div></div><p class="muted">運動日 ${wk.workoutDays}日／目標${d.profile.freqPerWeek || 3}日。月間：${energyText(monthAct.energy)}・${fmt(monthAct.volumeKg)}kg・${monthAct.cardioMin}分</p></div>
         <div class="card"><h3>前週との変化</h3><div class="stats"><div class="stat"><b>${wk.change == null ? '–' : (wk.change > 0 ? '+' : '') + wk.change}kg</b><span>7日平均の体重差</span></div><div class="stat"><b>${energyText(prevAct.energy)}</b><span>前週の運動消費</span></div><div class="stat"><b>${fmt(weekAct.volumeKg - prevAct.volumeKg)}</b><span>挙上量の差kg</span></div></div><p class="muted">体重の短期変動には水分・食塩・便通等も影響します。</p></div>
         <div class="card"><h3>使用した筋肉（今週）</h3>${Object.keys(weekAct.muscleSets).length ? `<div class="muscle-map">${Object.entries(weekAct.muscleSets).sort((a,b)=>b[1]-a[1]).map(([n,v])=>`<div class="muscle ${n.includes('胸')?'chest':n.includes('背')||n.includes('僧')?'back':n.includes('腕')?'arm':n.includes('腿')||n.includes('臀')||n.includes('ふくら')||n.includes('ハム')?'leg':'core'}"><b>${esc(n)}</b><span>${v}セット相当</span></div>`).join('')}</div>` : '<p class="muted">運動を記録すると、マシン種別から推定した使用筋肉を表示します。</p>'}<p class="muted">人体図はマシン種別からの推定です。機種が未確認の場合は正確性が下がります。</p></div>
-        <div class="card"><h3>体脂肪と筋肉の推移</h3><div class="stats"><div class="stat"><b>${last ? fmt(last.kg,1) : '–'}</b><span>体重kg（実測）</span></div><div class="stat"><b>${comp && comp.fatKg != null ? fmt(comp.fatKg,1) : '–'}</b><span>推定体脂肪kg</span></div><div class="stat"><b>${comp && comp.muscleKg != null ? fmt(comp.muscleKg,1) : '–'}</b><span>推定骨格筋kg</span></div></div>${CHARTS.weightChart(ma, d.profile.goalKg)}${CHARTS.seriesChart(compPts, [{key:'fat',name:'体脂肪kg',color:'#ea7a2e'},{key:'muscle',name:'骨格筋kg',color:'#2563eb'}], '体組成の推移')}<a class="btn block" href="#/weight">オムロン体組成を入力・取込</a></div>
-        <div class="card"><h3>食事と運動の関係（直近7日）</h3><div class="stats"><div class="stat"><b>${intake == null ? '–' : intake}</b><span>摂取kcal/記録日</span></div><div class="stat"><b>${tdee ? `${tdee.low}〜${tdee.high}` : '–'}</b><span>推定総消費kcal/日</span></div><div class="stat"><b>${dayCount ? Math.round(mealTot.protein/dayCount)+'g' : '–'}</b><span>タンパク質/記録日</span></div></div><p class="muted">総消費＝基礎代謝 × 日常活動の仮定（1.2〜1.4）＋運動推定。基礎代謝と総消費は別の値です。${pt ? `タンパク質の目安 ${pt.min}〜${pt.max}g/日。` : ''}</p><a class="btn block" href="#/import?type=meal">あすけん等のCSVを取込</a></div>
+        <div class="card"><h3>体脂肪と筋肉の推移</h3><div class="stats"><div class="stat"><b>${last ? fmt(last.kg,1) : '–'}</b><span>体重kg（実測）</span></div><div class="stat"><b>${comp && comp.fatKg != null ? fmt(comp.fatKg,1) : '–'}</b><span>推定体脂肪kg</span></div><div class="stat"><b>${comp && comp.muscleKg != null ? fmt(comp.muscleKg,1) : '–'}</b><span>推定骨格筋kg</span></div></div>${CHARTS.weightChart(ma, d.profile.goalKg)}${CHARTS.seriesChart(compPts, [{key:'fat',name:'体脂肪kg',color:'#ea7a2e'},{key:'muscle',name:'骨格筋kg',color:'#2563eb'}], '体組成の推移')}<a class="btn block" href="#/settings">ヘルスデータ自動連携の状態を見る</a></div>
+        <div class="card"><h3>食事と運動の関係（直近7日）</h3><div class="stats"><div class="stat"><b>${intake == null ? '–' : intake}</b><span>摂取kcal/記録日</span></div><div class="stat"><b>${tdee ? `${tdee.low}〜${tdee.high}` : '–'}</b><span>推定総消費kcal/日</span></div><div class="stat"><b>${dayCount ? Math.round(mealTot.protein/dayCount)+'g' : '–'}</b><span>タンパク質/記録日</span></div></div><p class="muted">総消費＝基礎代謝 × 日常活動の仮定（1.2〜1.4）＋運動推定。基礎代謝と総消費は別の値です。${pt ? `タンパク質の目安 ${pt.min}〜${pt.max}g/日。` : ''}</p></div>
         <div class="card"><h3>目標 ${d.profile.goalKg || 70}kg まで</h3><div class="stats"><div class="stat"><b>${kg ? fmt(kg-(d.profile.goalKg||70),1) : '–'}</b><span>残りkg</span></div><div class="stat"><b>${progress == null ? '–' : fmt(progress,0)+'%'}</b><span>開始値からの進捗</span></div><div class="stat"><b>${fc && fc.rate != null ? fmt(fc.rate,2) : '–'}</b><span>直近の週あたりkg</span></div></div>${!fc ? '<p class="muted">データ不足：予測には少なくとも14日・各期間4日以上の体重記録が必要です。</p>' : fc.weeks == null ? '<p class="muted">直近の傾向では目標到達時期を推定できません。</p>' : `<p>実績ベースの目安：<b>${Math.ceil(fc.range[0])}〜${Math.ceil(fc.range[1])}週</b>（中心 ${Math.ceil(fc.weeks)}週）</p>`}<p class="muted">体脂肪1kg≒7,700kcalは参考換算であり、減量を保証しません。実測の推移で毎週更新します。</p></div>
         <div class="card"><h3>計算の根拠と不確実性</h3><p class="muted">実測：体重・食事・運動記録。体組成計推定：体脂肪・骨格筋等。計算：運動消費（MET×体重×時間）、体脂肪量（体重×体脂肪率）。METはCompendium of Physical Activitiesの一般的な筋トレ3.5〜6.0、固定式バイク3.5〜10.0を目安にRPEで幅を付けています。家庭用体組成計は水分量などで変動するため、微小な筋肉量変化は断定しません。</p></div>
         <a class="btn primary block" href="#/next">次回メニューを見る</a>`;
@@ -565,6 +594,7 @@
     const p = await DB.kvGet('profile', {});
     const hasPin = !!(await DB.kvGet('pin', null));
     const useOFF = await DB.kvGet('useOFF', true);
+    const healthSync = await DB.kvGet('healthSyncStatus', null);
     view.innerHTML = `
       <div class="card"><h3>プロフィール</h3>
         <div class="row"><div><label>年齢</label><input id="p_age" type="number" inputmode="numeric" value="${p.age || ''}"></div>
@@ -578,7 +608,7 @@
         <label>運動上の制約（痛み・医師の指示など）</label><textarea id="p_cons">${esc(p.constraints || '')}</textarea>
         <button id="pSave" class="btn primary block">保存</button>
         <p class="muted">健康情報は端末内にだけ保存されます。外部には送信しません。</p></div>
-      <div class="card"><h3>外部データの取込</h3><p class="muted">公式に出力したCSVを端末内へ取り込みます。同じ日付・値の記録は重複させません。</p><a class="btn block" href="#/import?type=body">オムロン体組成CSVを取込</a><a class="btn block" href="#/import?type=meal">あすけん等の食事CSVを取込</a></div>
+      <div class="card"><h3>ヘルスデータ自動連携</h3><p id="healthState" class="muted">${healthSync && healthSync.lastSuccess ? `最終同期：${esc(new Date(healthSync.lastSuccess).toLocaleString('ja-JP'))}（体組成 ${healthSync.weights || 0}件・食事 ${healthSync.meals || 0}件）` : '未接続：Android companion または iPhone companion が必要です。通常のブラウザPWAからHealth Connect／Appleヘルスケアを直接読むことはできません。'}${healthSync && healthSync.error ? `<br><span class="tag warn">前回失敗：${esc(healthSync.error)}</span>` : ''}</p><button id="healthSyncBtn" class="btn block">端末のヘルスデータを同期</button><p class="muted">同期データはこの端末のブラウザ内だけに保存します。外部サーバーへの送信はありません。</p></div>
       <div class="card"><h3>ジム・マシン</h3>
         <p>${esc(SEED.GYM.name)}</p><p class="muted">${esc(SEED.GYM.address)}<br>${esc(SEED.GYM.hours)}</p>
         <a class="btn block" href="#/machines">マシン一覧・出典を見る／編集</a></div>
@@ -602,6 +632,10 @@
       await DB.kvSet('profile', p); toast('保存しました');
     };
     $('#s_off').onchange = (e) => DB.kvSet('useOFF', e.target.checked);
+    $('#healthSyncBtn').onclick = () => {
+      if (!window.AndroidHealth || !window.AndroidHealth.requestSync) return toast('Android companionアプリで開くと同期できます');
+      window.AndroidHealth.requestSync(); toast('Health Connectから同期中…');
+    };
     $('#bExp').onclick = async () => {
       const data = await DB.exportAll();
       const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
