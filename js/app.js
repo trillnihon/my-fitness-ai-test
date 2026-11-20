@@ -30,6 +30,8 @@
   };
   const byNewest = (a, b) => (b.date + b.createdAt).localeCompare(a.date + a.createdAt);
   const machineName = (machines, id) => { const m = machines.find((x) => x.id === id); return m ? m.name : '（不明なマシン）'; };
+  const latestWeight = (weights) => COACH.dailyWeights(weights).slice(-1)[0];
+  const energyText = (e) => e && e.low != null ? `${e.low}〜${e.high}kcal` : '時間を入力すると推定';
 
   /* ========== ホーム ========== */
   async function home() {
@@ -43,7 +45,7 @@
       <div class="big-actions">
         <a class="big meal" href="#/meal"><span class="ico">🍙</span><span>食事<small>写真・バーコード・検索・手入力</small></span></a>
         <a class="big work" href="#/workout"><span class="ico">🏋️</span><span>運動<small>筋トレ・バイク・次回メニュー</small></span></a>
-        <a class="big res" href="#/results"><span class="ico">📈</span><span>結果<small>体重・7日平均・週の変化・履歴</small></span></a>
+        <a class="big res" href="#/results"><span class="ico">📈</span><span>分析ダッシュボード<small>運動効果・体組成・食事・目標予測</small></span></a>
       </div>
       <div class="card">
         <h2>今日 ${jpDate(t)}</h2>
@@ -305,6 +307,7 @@
     setTitle('運動');
     const d = await load(); const t = today();
     const tw = d.workouts.filter((w) => w.date === t).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    const aw = latestWeight(d.weights); const todayActivity = COACH.activitySummary(tw, d.machines, aw && aw.kg, t, 1);
     const strength = d.machines.filter((m) => m.kind === 'strength' && ['chest', 'back', 'shoulder', 'legs', 'arms', 'core'].includes(m.category));
     const cardio = d.machines.filter((m) => m.kind === 'cardio');
     view.innerHTML = `
@@ -312,6 +315,7 @@
       <div class="card"><h3>筋トレを記録</h3><div class="chips">${strength.map((m) => `<a class="chip" href="#/workout/strength?machine=${m.id}">${esc(m.name)}</a>`).join('')}
         <a class="chip" href="#/workout/strength">＋その他</a></div></div>
       <div class="card"><h3>有酸素を記録</h3><div class="chips">${cardio.map((m) => `<a class="chip" href="#/workout/cardio?machine=${m.id}">${esc(m.name)}</a>`).join('')}</div></div>
+      <div class="card"><h3>今日の運動効果（推定）</h3><div class="stats"><div class="stat"><b>${energyText(todayActivity.energy)}</b><span>運動消費</span></div><div class="stat"><b>${fmt(todayActivity.volumeKg)}</b><span>総挙上kg</span></div><div class="stat"><b>${fmt(todayActivity.cardioMin)}</b><span>バイク等 分</span></div></div><p class="muted">MET×体重×時間による範囲推定。機器の負荷・重量だけでは正確な消費量は分かりません。</p></div>
       <div class="card"><h3>今日の運動</h3>${tw.length ? `<ul class="list">${tw.map((w) => workoutLi(w, d.machines)).join('')}</ul>` : '<p class="muted">まだありません。</p>'}</div>`;
   }
 
@@ -469,24 +473,29 @@
     let body = '';
     if (tab === 'summary') {
       const pt = COACH.proteinTarget(last ? last.kg : d.profile.weightKg);
+      const kg = last ? last.kg : d.profile.weightKg;
+      const weekAct = COACH.activitySummary(d.workouts, d.machines, kg, t, 7);
+      const monthAct = COACH.activitySummary(d.workouts, d.machines, kg, t, 30);
+      const prevAct = COACH.activitySummary(d.workouts, d.machines, kg, new Date(Date.parse(t) - 7 * 86400000).toISOString().slice(0, 10), 7);
+      const comp = COACH.bodyComposition(dw[dw.length - 1]);
+      const compPts = dw.slice(-60).map((x) => { const c = COACH.bodyComposition(x); return Object.assign({ date: x.date, weight: x.kg, fat: c && c.fatKg, muscle: c && c.muscleKg, visceral: x.visceralFatLevel }); });
+      const meal7 = d.meals.filter((m) => Date.parse(m.date) > Date.parse(t) - 7 * 86400000);
+      const mealTot = COACH.mealTotals(meal7); const dayCount = new Set(meal7.map((m) => m.date)).size;
+      const bmr = (dw[dw.length - 1] || {}).bmr || d.profile.bmr;
+      const intake = dayCount ? Math.round(mealTot.kcal / dayCount) : null;
+      const exerciseDaily = weekAct.energy ? Math.round((weekAct.energy.low + weekAct.energy.high) / 14) : null;
+      const tdee = bmr && intake != null ? { low: Math.round(+bmr * 1.2 + (weekAct.energy ? weekAct.energy.low / 7 : 0)), high: Math.round(+bmr * 1.4 + (weekAct.energy ? weekAct.energy.high / 7 : 0)) } : null;
+      const fc = COACH.forecast(d.weights, d.profile.goalKg || 70);
+      const startKg = d.profile.startKg || (dw[0] && dw[0].kg) || kg;
+      const progress = kg && d.profile.goalKg && startKg !== d.profile.goalKg ? Math.max(0, Math.min(100, (startKg - kg) / (startKg - d.profile.goalKg) * 100)) : null;
       body = `
-        <div class="card"><h3>体重</h3>
-          <div class="stats"><div class="stat"><b>${last ? fmt(last.kg, 1) : '–'}</b><span>最新kg</span></div>
-            <div class="stat"><b>${last ? fmt(last.avg, 1) : '–'}</b><span>7日平均</span></div>
-            <div class="stat"><b>${wk.change == null ? '–' : (wk.change > 0 ? '+' : '') + wk.change}</b><span>前週比kg</span></div></div>
-          ${CHARTS.weightChart(ma, d.profile.goalKg)}
-          <a class="btn block" href="#/weight">体重・体脂肪率を記録</a></div>
-        <div class="card"><h3>直近7日間</h3>
-          <ul class="list">
-            <li><div class="main">運動した日</div><b>${wk.workoutDays}日 / 目標${d.profile.freqPerWeek || 3}日</b></li>
-            <li><div class="main">筋トレ</div><b>${wk.strengthSets}セット</b></li>
-            <li><div class="main">有酸素</div><b>${wk.cardioMin}分</b></li>
-            <li><div class="main">摂取kcal（記録日の平均）</div><b>${wk.kcalAvg == null ? '–' : wk.kcalAvg}</b></li>
-            <li><div class="main">タンパク質（記録日の平均）</div><b>${wk.proteinAvg == null ? '–' : wk.proteinAvg + 'g'}${pt ? ` <span class="muted">目安${pt.min}〜${pt.max}</span>` : ''}</b></li>
-            ${wk.alcoholAvg ? `<li><div class="main">純アルコール（記録日の平均）</div><b>${wk.alcoholAvg}g</b></li>` : ''}
-          </ul>
-          <p class="muted">分析の確からしさ：${wk.confidence === 'medium' ? '中' : '低（データ不足）'}</p>
-          ${wk.notes.map((n) => `<div class="note">${esc(n)}</div>`).join('')}</div>
+        <div class="card hero"><h2>今日・今週の成果</h2><div class="stats"><div class="stat"><b>${energyText(weekAct.energy)}</b><span>今週の運動消費</span></div><div class="stat"><b>${fmt(weekAct.volumeKg)}</b><span>総挙上kg</span></div><div class="stat"><b>${weekAct.cardioMin}</b><span>有酸素 分</span></div></div><p class="muted">運動日 ${wk.workoutDays}日／目標${d.profile.freqPerWeek || 3}日。月間：${energyText(monthAct.energy)}・${fmt(monthAct.volumeKg)}kg・${monthAct.cardioMin}分</p></div>
+        <div class="card"><h3>前週との変化</h3><div class="stats"><div class="stat"><b>${wk.change == null ? '–' : (wk.change > 0 ? '+' : '') + wk.change}kg</b><span>7日平均の体重差</span></div><div class="stat"><b>${energyText(prevAct.energy)}</b><span>前週の運動消費</span></div><div class="stat"><b>${fmt(weekAct.volumeKg - prevAct.volumeKg)}</b><span>挙上量の差kg</span></div></div><p class="muted">体重の短期変動には水分・食塩・便通等も影響します。</p></div>
+        <div class="card"><h3>使用した筋肉（今週）</h3>${Object.keys(weekAct.muscleSets).length ? `<div class="muscle-map">${Object.entries(weekAct.muscleSets).sort((a,b)=>b[1]-a[1]).map(([n,v])=>`<div class="muscle ${n.includes('胸')?'chest':n.includes('背')||n.includes('僧')?'back':n.includes('腕')?'arm':n.includes('腿')||n.includes('臀')||n.includes('ふくら')||n.includes('ハム')?'leg':'core'}"><b>${esc(n)}</b><span>${v}セット相当</span></div>`).join('')}</div>` : '<p class="muted">運動を記録すると、マシン種別から推定した使用筋肉を表示します。</p>'}<p class="muted">人体図はマシン種別からの推定です。機種が未確認の場合は正確性が下がります。</p></div>
+        <div class="card"><h3>体脂肪と筋肉の推移</h3><div class="stats"><div class="stat"><b>${last ? fmt(last.kg,1) : '–'}</b><span>体重kg（実測）</span></div><div class="stat"><b>${comp && comp.fatKg != null ? fmt(comp.fatKg,1) : '–'}</b><span>推定体脂肪kg</span></div><div class="stat"><b>${comp && comp.muscleKg != null ? fmt(comp.muscleKg,1) : '–'}</b><span>推定骨格筋kg</span></div></div>${CHARTS.weightChart(ma, d.profile.goalKg)}${CHARTS.seriesChart(compPts, [{key:'fat',name:'体脂肪kg',color:'#ea7a2e'},{key:'muscle',name:'骨格筋kg',color:'#2563eb'}], '体組成の推移')}<a class="btn block" href="#/weight">オムロン体組成を入力・取込</a></div>
+        <div class="card"><h3>食事と運動の関係（直近7日）</h3><div class="stats"><div class="stat"><b>${intake == null ? '–' : intake}</b><span>摂取kcal/記録日</span></div><div class="stat"><b>${tdee ? `${tdee.low}〜${tdee.high}` : '–'}</b><span>推定総消費kcal/日</span></div><div class="stat"><b>${dayCount ? Math.round(mealTot.protein/dayCount)+'g' : '–'}</b><span>タンパク質/記録日</span></div></div><p class="muted">総消費＝基礎代謝 × 日常活動の仮定（1.2〜1.4）＋運動推定。基礎代謝と総消費は別の値です。${pt ? `タンパク質の目安 ${pt.min}〜${pt.max}g/日。` : ''}</p><a class="btn block" href="#/import?type=meal">あすけん等のCSVを取込</a></div>
+        <div class="card"><h3>目標 ${d.profile.goalKg || 70}kg まで</h3><div class="stats"><div class="stat"><b>${kg ? fmt(kg-(d.profile.goalKg||70),1) : '–'}</b><span>残りkg</span></div><div class="stat"><b>${progress == null ? '–' : fmt(progress,0)+'%'}</b><span>開始値からの進捗</span></div><div class="stat"><b>${fc && fc.rate != null ? fmt(fc.rate,2) : '–'}</b><span>直近の週あたりkg</span></div></div>${!fc ? '<p class="muted">データ不足：予測には少なくとも14日・各期間4日以上の体重記録が必要です。</p>' : fc.weeks == null ? '<p class="muted">直近の傾向では目標到達時期を推定できません。</p>' : `<p>実績ベースの目安：<b>${Math.ceil(fc.range[0])}〜${Math.ceil(fc.range[1])}週</b>（中心 ${Math.ceil(fc.weeks)}週）</p>`}<p class="muted">体脂肪1kg≒7,700kcalは参考換算であり、減量を保証しません。実測の推移で毎週更新します。</p></div>
+        <div class="card"><h3>計算の根拠と不確実性</h3><p class="muted">実測：体重・食事・運動記録。体組成計推定：体脂肪・骨格筋等。計算：運動消費（MET×体重×時間）、体脂肪量（体重×体脂肪率）。METはCompendium of Physical Activitiesの一般的な筋トレ3.5〜6.0、固定式バイク3.5〜10.0を目安にRPEで幅を付けています。家庭用体組成計は水分量などで変動するため、微小な筋肉量変化は断定しません。</p></div>
         <a class="btn primary block" href="#/next">次回メニューを見る</a>`;
     } else {
       const days = {};
@@ -507,6 +516,30 @@
     $$('.seg button').forEach((b) => b.onclick = () => go('#/results?tab=' + b.dataset.t));
   }
 
+  function parseCsv(text) {
+    const rows = []; let row = [], cell = '', quoted = false;
+    for (let i = 0; i < text.length; i++) { const c = text[i]; if (c === '"') { if (quoted && text[i + 1] === '"') { cell += c; i++; } else quoted = !quoted; } else if (c === ',' && !quoted) { row.push(cell.trim()); cell = ''; } else if ((c === '\n' || c === '\r') && !quoted) { if (c === '\r' && text[i + 1] === '\n') i++; row.push(cell.trim()); if (row.some(Boolean)) rows.push(row); row = []; cell = ''; } else cell += c; }
+    if (cell || row.length) { row.push(cell.trim()); rows.push(row); } return rows;
+  }
+  const csvValue = (o, names) => { const k = Object.keys(o).find((x) => names.includes(x.replace(/\s/g, ''))); return k ? o[k] : null; };
+  async function importData(q) {
+    const type = q.type === 'meal' ? 'meal' : 'body'; setTitle(type === 'meal' ? '食事CSV取込' : '体組成CSV取込', true);
+    view.innerHTML = `<div class="card"><h3>${type === 'meal' ? 'あすけん等の食事データ' : 'オムロン等の体組成データ'}</h3><p class="muted">公式にエクスポートしたCSV、または同じ列を持つ本人作成CSVを、この端末内へ取り込みます。サービスへのログインや自動取得は行いません。</p><input id="csvFile" type="file" accept=".csv,text/csv"><button id="csvGo" class="btn primary block">CSVを取り込む</button></div><div class="card"><h3>対応列（列順は自由）</h3><p class="muted">${type === 'meal' ? '日付/日時、食品名、カロリー(kcal)、たんぱく質/P、脂質/F、炭水化物/C、食塩相当量、食事区分、摂取量' : '日付/日時、体重、体脂肪率、骨格筋率、骨格筋量、内臓脂肪レベル、基礎代謝、体年齢'}。文字コードはUTF-8を推奨します。</p></div>`;
+    $('#csvGo').onclick = async () => {
+      const f = $('#csvFile').files[0]; if (!f) return toast('CSVファイルを選択してください');
+      try {
+        const rows = parseCsv(await f.text()); if (rows.length < 2) throw new Error('見出しとデータ行が必要です');
+        const headers = rows.shift().map((x) => x.replace(/^\uFEFF/, '')); let add = 0, skip = 0;
+        const existing = await DB.all(type === 'meal' ? 'meals' : 'weights');
+        for (const r of rows) { const o = Object.fromEntries(headers.map((h, i) => [h, r[i] || ''])); const rawDate = csvValue(o, ['日付','日時','測定日時','date','Date','datetime']); const date = rawDate && rawDate.match(/\d{4}[-\/]\d{1,2}[-\/]\d{1,2}/); if (!date) { skip++; continue; } const day = date[0].replace(/\//g, '-').replace(/-(\d)(?=-|$)/g, '-0$1');
+          if (type === 'body') { const kg = num(csvValue(o, ['体重','体重kg','weight','Weight'])); if (!kg) { skip++; continue; } const sig = `${day}|${kg}`; if (existing.some((x) => `${x.date}|${x.kg}` === sig)) { skip++; continue; } await DB.put('weights', { date: day, kg, bodyFatPct: num(csvValue(o, ['体脂肪率','体脂肪率%','bodyfat','BodyFat'])), skeletalMusclePct: num(csvValue(o, ['骨格筋率','skeletalmuscle%'])), skeletalMuscleKg: num(csvValue(o, ['骨格筋量','推定骨格筋量','skeletalmusclekg'])), fatKg: num(csvValue(o, ['推定体脂肪量','体脂肪量','fatkg'])), visceralFatLevel: num(csvValue(o, ['内臓脂肪レベル','visceralfat'])), bmr: num(csvValue(o, ['基礎代謝','基礎代謝量','bmr'])), bodyAge: num(csvValue(o, ['体年齢','bodyage'])), source: 'csv', note: 'CSV取込' }); add++; }
+          else { const name = csvValue(o, ['食品名','食べたもの','name','Name']); const kcal = num(csvValue(o, ['カロリー','kcal','エネルギー','Calories'])); if (!name || kcal == null) { skip++; continue; } const sig = `${day}|${name}|${kcal}`; if (existing.some((x) => `${x.date}|${x.name}|${x.kcal}` === sig)) { skip++; continue; } await DB.put('meals', { date: day, name, kcal, protein: num(csvValue(o, ['たんぱく質','タンパク質','protein','P'])), fat: num(csvValue(o, ['脂質','fat','F'])), carbs: num(csvValue(o, ['炭水化物','carbs','C'])), salt: num(csvValue(o, ['食塩相当量','salt'])), qty: num(csvValue(o, ['摂取量','qty','quantity'])) || 1, mealType: csvValue(o, ['食事区分','食事','mealtype']) || '食事', valueType: 'external', source: 'CSV取込' }); add++; }
+        }
+        toast(`${add}件を取込（重複/不足 ${skip}件）`); go(type === 'meal' ? '#/meal' : '#/results');
+      } catch (e) { toast('取込できません: ' + e.message); }
+    };
+  }
+
   async function weightForm(id) {
     const w = id ? await DB.get('weights', id) : { date: today(), kg: '', bodyFatPct: '' };
     setTitle(id ? '体重を編集' : '体重を記録', true);
@@ -514,12 +547,13 @@
       <label>日付</label><input id="ww_date" type="date" value="${w.date}">
       <div class="row"><div><label>体重 kg</label><input id="ww_kg" type="number" inputmode="decimal" step="0.1" value="${w.kg || ''}"></div>
         <div><label>体脂肪率 %</label><input id="ww_bf" type="number" inputmode="decimal" step="0.1" value="${w.bodyFatPct || ''}"></div></div>
+      <details><summary>オムロン体組成の項目（任意）</summary><div class="row"><div><label>推定体脂肪量 kg</label><input id="ww_fatkg" type="number" step="0.1" value="${w.fatKg || ''}"></div><div><label>骨格筋率 %</label><input id="ww_smp" type="number" step="0.1" value="${w.skeletalMusclePct || ''}"></div></div><div class="row"><div><label>推定骨格筋量 kg</label><input id="ww_smk" type="number" step="0.1" value="${w.skeletalMuscleKg || ''}"></div><div><label>内臓脂肪レベル</label><input id="ww_vf" type="number" step="0.1" value="${w.visceralFatLevel || ''}"></div></div><div class="row"><div><label>基礎代謝 kcal/日</label><input id="ww_bmr" type="number" value="${w.bmr || ''}"></div><div><label>体年齢</label><input id="ww_age" type="number" value="${w.bodyAge || ''}"></div></div></details>
       <label>メモ</label><input id="ww_note" value="${esc(w.note || '')}" placeholder="朝・トイレ後 など">
       <button id="wwSave" class="btn primary block">保存</button>${id ? '<button id="wwDel" class="btn danger block">削除</button>' : ''}
       <p class="muted">毎日同じ条件（朝起きてトイレの後など）で測ると、7日平均の変化が読み取りやすくなります。</p></div>`;
     $('#wwSave').onclick = async () => {
       const kg = num($('#ww_kg').value); if (!kg || kg < 20 || kg > 300) return toast('体重を正しく入力してください');
-      await DB.put('weights', Object.assign({}, w, { date: $('#ww_date').value || today(), kg, bodyFatPct: num($('#ww_bf').value), note: $('#ww_note').value.trim() }));
+      await DB.put('weights', Object.assign({}, w, { date: $('#ww_date').value || today(), kg, bodyFatPct: num($('#ww_bf').value), fatKg: num($('#ww_fatkg').value), skeletalMusclePct: num($('#ww_smp').value), skeletalMuscleKg: num($('#ww_smk').value), visceralFatLevel: num($('#ww_vf').value), bmr: num($('#ww_bmr').value), bodyAge: num($('#ww_age').value), source: 'manual', note: $('#ww_note').value.trim() }));
       toast('保存しました'); go('#/results');
     };
     if (id) $('#wwDel').onclick = async () => { if (!confirm('削除しますか？')) return; await DB.remove('weights', id); go('#/results?tab=history'); };
@@ -537,12 +571,14 @@
           <div><label>身長 cm</label><input id="p_h" type="number" inputmode="decimal" value="${p.heightCm || ''}"></div></div>
         <div class="row"><div><label>目標体重 kg</label><input id="p_goal" type="number" inputmode="decimal" step="0.1" value="${p.goalKg || ''}"></div>
           <div><label>運動頻度 回/週</label><input id="p_freq" type="number" inputmode="numeric" value="${p.freqPerWeek || ''}"></div></div>
+        <div class="row"><div><label>開始体重 kg（進捗表示用）</label><input id="p_start" type="number" inputmode="decimal" step="0.1" value="${p.startKg || ''}"></div><div><label>基礎代謝 kcal/日（任意）</label><input id="p_bmr" type="number" inputmode="numeric" value="${p.bmr || ''}"></div></div>
         <label>目的</label><input id="p_goals" value="${esc((p.goals || []).join('、'))}">
         <label>運動経験</label><input id="p_exp" value="${esc(p.experience || '')}" placeholder="例 マシン中心で2年">
         <label>既往歴・持病・服薬</label><textarea id="p_cond">${esc(p.conditions || '')}</textarea>
         <label>運動上の制約（痛み・医師の指示など）</label><textarea id="p_cons">${esc(p.constraints || '')}</textarea>
         <button id="pSave" class="btn primary block">保存</button>
         <p class="muted">健康情報は端末内にだけ保存されます。外部には送信しません。</p></div>
+      <div class="card"><h3>外部データの取込</h3><p class="muted">公式に出力したCSVを端末内へ取り込みます。同じ日付・値の記録は重複させません。</p><a class="btn block" href="#/import?type=body">オムロン体組成CSVを取込</a><a class="btn block" href="#/import?type=meal">あすけん等の食事CSVを取込</a></div>
       <div class="card"><h3>ジム・マシン</h3>
         <p>${esc(SEED.GYM.name)}</p><p class="muted">${esc(SEED.GYM.address)}<br>${esc(SEED.GYM.hours)}</p>
         <a class="btn block" href="#/machines">マシン一覧・出典を見る／編集</a></div>
@@ -560,7 +596,7 @@
       <div class="card"><h3>このアプリについて</h3><p class="muted">My Fitness AI v0.1（合同会社トリル）／データ保存先：この端末のブラウザ内（IndexedDB）</p>
         <button id="wipe" class="btn danger block">全データを消去</button></div>`;
     $('#pSave').onclick = async () => {
-      Object.assign(p, { age: num($('#p_age').value), heightCm: num($('#p_h').value), goalKg: num($('#p_goal').value), freqPerWeek: num($('#p_freq').value),
+      Object.assign(p, { age: num($('#p_age').value), heightCm: num($('#p_h').value), goalKg: num($('#p_goal').value), startKg: num($('#p_start').value), bmr: num($('#p_bmr').value), freqPerWeek: num($('#p_freq').value),
         goals: $('#p_goals').value.split(/[、,]/).map((s) => s.trim()).filter(Boolean), experience: $('#p_exp').value.trim(),
         conditions: $('#p_cond').value.trim(), constraints: $('#p_cons').value.trim() });
       await DB.kvSet('profile', p); toast('保存しました');
@@ -734,6 +770,7 @@
       if (a === 'next') return await nextMenu(q);
       if (a === 'results') return await results(q);
       if (a === 'weight') return await weightForm(b);
+      if (a === 'import') return await importData(q);
       if (a === 'settings') return await settings();
       if (a === 'machines') return await machines();
       if (a === 'machine') return await machineForm(b);

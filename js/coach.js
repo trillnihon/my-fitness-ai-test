@@ -109,7 +109,7 @@
   function dailyWeights(rows) {
     const byDay = {};
     rows.slice().sort((a, b) => (a.date + a.createdAt).localeCompare(b.date + b.createdAt))
-      .forEach((r) => { if (r.kg) byDay[r.date] = { date: r.date, kg: +r.kg, bodyFatPct: r.bodyFatPct }; });
+      .forEach((r) => { if (r.kg) byDay[r.date] = Object.assign({}, r, { date: r.date, kg: +r.kg, bodyFatPct: r.bodyFatPct }); });
     return Object.values(byDay).sort((a, b) => a.date.localeCompare(b.date));
   }
 
@@ -161,7 +161,73 @@
   /** タンパク質の目安（体重×1.2〜1.6g）。体重がなければ null。 */
   function proteinTarget(kg) { return kg ? { min: Math.round(kg * 1.2), max: Math.round(kg * 1.6) } : null; }
 
-  const api = { suggestStrength, suggestCardio, movingAvg, dailyWeights, pureAlcoholG, mealTotals, weekly, proteinTarget };
+  // MET は「安静時の何倍のエネルギー消費か」の公的な運動強度の目安。
+  // 機械の負荷番号・重量だけで正確な消費量は決められないため、RPE/心拍が
+  // 未入力なら広めの範囲を返す。 kcal = MET × 体重(kg) × 時間(h)。
+  function exerciseEnergy(w, bodyKg) {
+    const kg = +bodyKg || 60;
+    const min = +w.minutes || (w.kind === 'strength' ? 20 : 0);
+    if (!min) return { low: null, high: null, minutes: 0, label: '時間未入力' };
+    let low, high;
+    if (w.kind === 'cardio') {
+      const r = +w.rpe || 0;
+      // Compendium: stationary cycling の軽度〜強度域を、記録の主観強度で補助。
+      low = r >= 8 ? 7.0 : r >= 6 ? 5.5 : 3.5;
+      high = r >= 8 ? 10.0 : r >= 6 ? 8.0 : 5.5;
+    } else {
+      // resistance training: general/moderate-to-vigorous 3.5–6.0 MET.
+      low = (+w.rpe || 0) >= 8 ? 4.5 : 3.5;
+      high = (+w.rpe || 0) >= 8 ? 6.0 : 5.0;
+    }
+    const f = min / 60 * kg;
+    return { low: Math.round(low * f), high: Math.round(high * f), minutes: min, label: 'MET推定' };
+  }
+  function volume(w) { return (w.sets || []).reduce((s, x) => s + (+x.kg || 0) * (+x.reps || 0), 0); }
+  function muscleMap(machine, w) {
+    if (machine && Array.isArray(machine.muscles) && machine.muscles.length) return { muscles: machine.muscles, estimated: machine.status !== 'confirmed' };
+    const category = machine && machine.category;
+    const map = {
+      chest: ['大胸筋', '上腕三頭筋', '三角筋前部'], back: ['広背筋', '僧帽筋', '上腕二頭筋'],
+      shoulder: ['三角筋', '僧帽筋'], legs: ['大腿四頭筋', '臀筋', 'ハムストリングス', 'ふくらはぎ'],
+      arms: ['上腕二頭筋', '上腕三頭筋'], core: ['腹直筋', '腹斜筋'], cardio: ['大腿四頭筋', '臀筋', 'ハムストリングス', 'ふくらはぎ']
+    };
+    return { muscles: map[category] || (w.kind === 'cardio' ? map.cardio : ['対象部位未設定']), estimated: true };
+  }
+  function dateRange(days, end) {
+    const e = Date.parse(end); return (date) => { const d = Date.parse(date); return d > e - days * DAY && d <= e; };
+  }
+  function activitySummary(workouts, machines, bodyKg, end, days) {
+    const inRange = dateRange(days || 7, end);
+    const list = workouts.filter((w) => inRange(w.date));
+    const muscleSets = {}, energy = { low: 0, high: 0, known: 0 }, byDay = {};
+    let volumeKg = 0, cardioMin = 0;
+    list.forEach((w) => {
+      const e = exerciseEnergy(w, bodyKg); if (e.low != null) { energy.low += e.low; energy.high += e.high; energy.known++; }
+      const day = byDay[w.date] || (byDay[w.date] = { low: 0, high: 0 }); if (e.low != null) { day.low += e.low; day.high += e.high; }
+      if (w.kind === 'strength') { volumeKg += volume(w); const m = muscleMap((machines || []).find((x) => x.id === w.machineId), w); m.muscles.forEach((x) => muscleSets[x] = (muscleSets[x] || 0) + (w.sets || []).length); }
+      else cardioMin += +w.minutes || 0;
+    });
+    return { list, volumeKg, cardioMin, muscleSets, energy: energy.known ? energy : null, byDay };
+  }
+  function bodyComposition(row) {
+    if (!row || !row.kg) return null;
+    const fatKg = row.fatKg != null ? +row.fatKg : row.bodyFatPct != null ? +row.kg * +row.bodyFatPct / 100 : null;
+    return { fatKg, leanKg: fatKg == null ? null : +row.kg - fatKg, muscleKg: row.skeletalMuscleKg == null ? null : +row.skeletalMuscleKg };
+  }
+  function forecast(weights, goalKg) {
+    const pts = dailyWeights(weights).slice(-42); if (pts.length < 14 || !goalKg) return null;
+    const a = pts.slice(0, Math.min(7, pts.length)); const b = pts.slice(-7);
+    if (a.length < 4 || b.length < 4) return null;
+    const avg = (x) => x.reduce((s, p) => s + p.kg, 0) / x.length;
+    const rate = (avg(b) - avg(a)) / Math.max(1, (Date.parse(b[b.length - 1].date) - Date.parse(a[a.length - 1].date)) / DAY) * 7;
+    const current = avg(b), remaining = current - +goalKg;
+    if (remaining <= 0) return { current, rate, weeks: 0, range: [0, 0] };
+    if (rate >= -0.05) return { current, rate, weeks: null, range: null };
+    const weeks = remaining / -rate;
+    return { current, rate, weeks, range: [Math.max(1, weeks * .7), weeks * 1.4] };
+  }
+
+  const api = { suggestStrength, suggestCardio, movingAvg, dailyWeights, pureAlcoholG, mealTotals, weekly, proteinTarget, exerciseEnergy, volume, muscleMap, activitySummary, bodyComposition, forecast };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   root.COACH = api;
 })(typeof window !== 'undefined' ? window : globalThis);

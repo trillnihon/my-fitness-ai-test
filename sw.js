@@ -1,5 +1,5 @@
 /* オフライン用キャッシュ。版を上げると古いキャッシュを削除する。 */
-const VERSION = 'mfa-v0.1.1';
+const VERSION = 'mfa-v0.2.0';
 const ASSETS = ['./', 'index.html', 'css/app.css', 'js/db.js', 'js/seed.js', 'js/coach.js', 'js/charts.js', 'js/barcode.js', 'js/app.js',
   'vendor/zxing.min.js', 'manifest.webmanifest', 'icons/icon.svg', 'icons/icon-180.png', 'icons/icon-192.png', 'icons/icon-512.png'];
 self.addEventListener('install', (e) => { e.waitUntil(caches.open(VERSION).then((c) => c.addAll(ASSETS)).then(() => self.skipWaiting())); });

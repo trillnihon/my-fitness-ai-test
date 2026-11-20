@@ -26,5 +26,18 @@
       + (points.length > 1 ? `<path d="${line('avg')}" fill="none" stroke="#7c3aed" stroke-width="2.5"/>` : '')
       + `</svg><p class="muted">点＝毎日の体重　線＝7日平均${goalKg ? '　破線＝目標' : ''}</p>`;
   }
-  window.CHARTS = { weightChart };
+  function seriesChart(points, series, label) {
+    const usable = points.filter((p) => series.some((s) => p[s.key] != null));
+    if (!usable.length) return '<p class="muted">表示できる記録がまだありません。</p>';
+    const W = 340, H = 180, P = { l: 34, r: 10, t: 10, b: 22 };
+    const vals = usable.flatMap((p) => series.map((s) => +p[s.key]).filter(Number.isFinite));
+    let lo = Math.min(...vals), hi = Math.max(...vals); if (hi - lo < 1) { lo -= .5; hi += .5; }
+    const t0 = Date.parse(usable[0].date), t1 = Date.parse(usable[usable.length - 1].date), span = Math.max(t1 - t0, 86400000);
+    const x = (d) => P.l + (Date.parse(d) - t0) / span * (W - P.l - P.r);
+    const y = (v) => P.t + (hi - v) / (hi - lo) * (H - P.t - P.b);
+    let grid = ''; for (let i = 0; i < 4; i++) { const v = lo + (hi - lo) * i / 3; grid += `<line x1="${P.l}" x2="${W-P.r}" y1="${y(v)}" y2="${y(v)}" stroke="currentColor" stroke-opacity=".12"/><text x="${P.l-4}" y="${y(v)+3}" text-anchor="end">${v.toFixed(1)}</text>`; }
+    const lines = series.map((s) => { const p = usable.filter((q) => q[s.key] != null); const d = p.map((q, i) => `${i ? 'L' : 'M'}${x(q.date).toFixed(1)},${y(q[s.key]).toFixed(1)}`).join(''); return `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="2.5"/><g fill="${s.color}">${p.map((q) => `<circle cx="${x(q.date).toFixed(1)}" cy="${y(q[s.key]).toFixed(1)}" r="3"><title>${q.date}: ${s.name} ${q[s.key]}</title></circle>`).join('')}</g>`; }).join('');
+    return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="${label}">${grid}${lines}<text x="${P.l}" y="${H-6}">${usable[0].date.slice(5).replace('-', '/')}</text><text x="${W-P.r}" y="${H-6}" text-anchor="end">${usable[usable.length-1].date.slice(5).replace('-', '/')}</text></svg><p class="muted">${series.map((s) => `<span style="color:${s.color}">●</span>${s.name}`).join('　')}（点をタップ／長押しで値を確認）</p>`;
+  }
+  window.CHARTS = { weightChart, seriesChart };
 })();
